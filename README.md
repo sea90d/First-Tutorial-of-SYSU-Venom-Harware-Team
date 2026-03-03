@@ -87,6 +87,8 @@ $$
 T_{\mathrm{AHT20}}\left(^\circ\mathrm{C}\right)=\frac{S_T}{1048576}\times200-50
 $$
 
+符号说明：$\mathrm{RH}$ 表示相对湿度（Relative Humidity），$T_{\mathrm{AHT20}}$ 表示 AHT20 计算温度。
+
 ### 3.2 NTC 温度计算（Steinhart-Hart）
 
 由分压关系（上拉电阻 $R_{ref}=10k\Omega$）：
