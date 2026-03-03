@@ -1,0 +1,37 @@
+# STM32 / Keil / ArmClang build outputs
+*.axf
+*.bin
+*.hex
+*.elf
+*.map
+*.lst
+*.o
+*.d
+*.dep
+*.crf
+*.htm
+*.html
+
+# Build directories
+**/Debug/
+**/Release/
+**/build/
+**/cmake-build-*/
+MDK-ARM/Desktop/
+
+# Keil user/session files (keep .uvprojx, ignore local options/UI state)
+*.uvoptx
+*.uvguix.*
+
+# Temporary / logs
+*.log
+*.tmp
+*.bak
+
+# VS Code local logs/locks
+.vscode/*.log
+.vscode/*.lock
+
+# OS files
+Thumbs.db
+.DS_Store
