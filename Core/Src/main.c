@@ -24,6 +24,7 @@
 #include "oled.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* USER CODE END Includes */
@@ -63,13 +64,22 @@ static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static HAL_StatusTypeDef AHT20_Init(void);
 static HAL_StatusTypeDef AHT20_Read(float *temperature, float *humidity);
-static float Read_ADC_Voltage(void);
-static float Read_NTC_Temperature(void);
-static float Calculate_NTC_Temperature(float voltage);
+static uint32_t Read_ADC_Raw(void);
+static float Read_ADC_Voltage(uint32_t adc_raw);
+static float Read_NTC_Temperature(float *ntc_voltage_out, float *ntc_resistance_out, uint32_t *adc_raw_out);
+static float Calculate_NTC_Temperature(float voltage, float *ntc_resistance_out);
+static long Float_ToScaledInt(float value, long scale);
+static void Format_FixedValue(char *buf, size_t buf_size, float value, uint8_t frac_digits, uint8_t min_int_width);
+/* Breath LED helpers kept for future use.
+static float Clamp_Float(float value, float min_value, float max_value);
+static uint32_t Get_Breath_PeriodMs(float temperature_c);
+static void Update_Breath_LED(float temperature_c);
+*/
 static void UART_PrintString(const char *str);
 static void I2C1_ScanDevices(void);
 static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg);
-static void UART_PrintEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg);
+static void UART_PrintEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg,
+                              uint32_t ntc_adc_raw, float ntc_voltage, float ntc_resistance);
 
 /* USER CODE END PFP */
 
@@ -88,6 +98,158 @@ static void UART_PrintEnvData(uint8_t aht20_valid, float temp_aht20, float hum_a
 #define ADC_MAX_VALUE               4095.0f
 #define NTC_REF_RESISTOR            10000.0f
 #define NTC_MIN_VALID_VOLTAGE       0.01f
+#define NTC_R25_OHM                 10000.0f
+#define NTC_R50_OHM                 3588.0f
+#define NTC_T25_C                   25.0f
+#define NTC_T50_C                   50.0f
+#define KELVIN_OFFSET               273.15f
+/* Breath LED configuration kept for future use.
+#define LED_BREATH_GPIO_PORT        GPIOA
+#define LED_BREATH_GPIO_PIN         GPIO_PIN_1
+#define LED_PWM_PERIOD_MS           20U
+#define LED_BREATH_STEP_MS          5U
+#define LED_BREATH_MIN_TEMP_C       20.0f
+#define LED_BREATH_MAX_TEMP_C       60.0f
+#define LED_BREATH_MIN_PERIOD_MS    400U
+#define LED_BREATH_MAX_PERIOD_MS    1800U
+*/
+
+static long Float_ToScaledInt(float value, long scale)
+{
+  float scaled = value * (float)scale;
+
+  if (scaled >= 0.0f)
+  {
+    return (long)(scaled + 0.5f);
+  }
+
+  return (long)(scaled - 0.5f);
+}
+
+static void Format_FixedValue(char *buf, size_t buf_size, float value, uint8_t frac_digits, uint8_t min_int_width)
+{
+  long scale = 1L;
+  long scaled = 0L;
+  long integer_part = 0L;
+  long fraction_part = 0L;
+
+  if ((buf == NULL) || (buf_size == 0U))
+  {
+    return;
+  }
+
+  for (uint8_t i = 0; i < frac_digits; i++)
+  {
+    scale *= 10L;
+  }
+
+  scaled = Float_ToScaledInt(value, scale);
+  integer_part = scaled / scale;
+  fraction_part = labs(scaled % scale);
+
+  if (frac_digits == 0U)
+  {
+    (void)snprintf(buf, buf_size, "%*ld", (int)min_int_width, integer_part);
+  }
+  else if (frac_digits == 2U)
+  {
+    (void)snprintf(buf, buf_size, "%*ld.%02ld", (int)min_int_width, integer_part, fraction_part);
+  }
+  else if (frac_digits == 3U)
+  {
+    (void)snprintf(buf, buf_size, "%*ld.%03ld", (int)min_int_width, integer_part, fraction_part);
+  }
+  else
+  {
+    (void)snprintf(buf, buf_size, "%ld", integer_part);
+  }
+}
+
+/* Breath LED logic kept for future use.
+static float Clamp_Float(float value, float min_value, float max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+
+  if (value > max_value)
+  {
+    return max_value;
+  }
+
+  return value;
+}
+
+static uint32_t Get_Breath_PeriodMs(float temperature_c)
+{
+  float clamped_temp = 0.0f;
+  float ratio = 0.0f;
+  float period = 0.0f;
+
+  if (!isfinite(temperature_c))
+  {
+    return LED_BREATH_MAX_PERIOD_MS;
+  }
+
+  clamped_temp = Clamp_Float(temperature_c, LED_BREATH_MIN_TEMP_C, LED_BREATH_MAX_TEMP_C);
+  ratio = (clamped_temp - LED_BREATH_MIN_TEMP_C) / (LED_BREATH_MAX_TEMP_C - LED_BREATH_MIN_TEMP_C);
+  period = (float)LED_BREATH_MAX_PERIOD_MS - ratio * (float)(LED_BREATH_MAX_PERIOD_MS - LED_BREATH_MIN_PERIOD_MS);
+
+  return (uint32_t)(period + 0.5f);
+}
+
+static void Update_Breath_LED(float temperature_c)
+{
+  static uint32_t last_step_tick = 0U;
+  static uint32_t pwm_window_start = 0U;
+  static uint32_t phase_ms = 0U;
+  static uint8_t brightness_percent = 0U;
+  uint32_t now = HAL_GetTick();
+  uint32_t breath_period_ms = Get_Breath_PeriodMs(temperature_c);
+  uint32_t half_period_ms = breath_period_ms / 2U;
+  uint32_t elapsed_pwm_ms = 0U;
+
+  if ((now - last_step_tick) >= LED_BREATH_STEP_MS)
+  {
+    last_step_tick = now;
+    phase_ms += LED_BREATH_STEP_MS;
+
+    if (phase_ms >= breath_period_ms)
+    {
+      phase_ms %= breath_period_ms;
+    }
+
+    if (half_period_ms == 0U)
+    {
+      brightness_percent = 100U;
+    }
+    else if (phase_ms < half_period_ms)
+    {
+      brightness_percent = (uint8_t)((phase_ms * 100U) / half_period_ms);
+    }
+    else
+    {
+      brightness_percent = (uint8_t)(((breath_period_ms - phase_ms) * 100U) / half_period_ms);
+    }
+  }
+
+  if ((now - pwm_window_start) >= LED_PWM_PERIOD_MS)
+  {
+    pwm_window_start = now;
+  }
+
+  elapsed_pwm_ms = now - pwm_window_start;
+  if (elapsed_pwm_ms < ((LED_PWM_PERIOD_MS * brightness_percent) / 100U))
+  {
+    HAL_GPIO_WritePin(LED_BREATH_GPIO_PORT, LED_BREATH_GPIO_PIN, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(LED_BREATH_GPIO_PORT, LED_BREATH_GPIO_PIN, GPIO_PIN_RESET);
+  }
+}
+*/
 
 static void UART_PrintString(const char *str)
 {
@@ -198,67 +360,110 @@ static HAL_StatusTypeDef AHT20_Read(float *temperature, float *humidity)
   return HAL_BUSY;
 }
 
-static float Read_ADC_Voltage(void)
+static uint32_t Read_ADC_Raw(void)
 {
   uint32_t adc_raw = 0;
 
   if (HAL_ADC_Start(&hadc1) != HAL_OK)
   {
-    return 0.0f;
+    return 0U;
   }
 
   if (HAL_ADC_PollForConversion(&hadc1, 50) != HAL_OK)
   {
     (void)HAL_ADC_Stop(&hadc1);
-    return 0.0f;
+    return 0U;
   }
 
   adc_raw = HAL_ADC_GetValue(&hadc1);
   (void)HAL_ADC_Stop(&hadc1);
 
+  return adc_raw;
+}
+
+static float Read_ADC_Voltage(uint32_t adc_raw)
+{
   return ((float)adc_raw * ADC_VREF) / ADC_MAX_VALUE;
 }
 
-static float Calculate_NTC_Temperature(float voltage)
+static float Calculate_NTC_Temperature(float voltage, float *ntc_resistance_out)
 {
   float resistance = 0.0f;
-  float steinhart = 0.0f;
+  float ta_kelvin = NTC_T25_C + KELVIN_OFFSET;
+  float tb_kelvin = NTC_T50_C + KELVIN_OFFSET;
+  float beta = 0.0f;
+  float temperature_kelvin = 0.0f;
 
   if ((voltage <= NTC_MIN_VALID_VOLTAGE) || (voltage >= (ADC_VREF - NTC_MIN_VALID_VOLTAGE)))
   {
     return NAN;
   }
 
-  resistance = (ADC_VREF - voltage) * NTC_REF_RESISTOR / voltage;
-  steinhart = resistance / NTC_REF_RESISTOR;
-  steinhart = logf(steinhart);
-  steinhart = 1.0f / (0.001129148f + 0.000234125f * steinhart + 0.0000000876741f * powf(steinhart, 3.0f));
+  resistance = voltage * NTC_REF_RESISTOR / (ADC_VREF - voltage);
+  if (resistance <= 0.0f)
+  {
+    return NAN;
+  }
 
-  return steinhart - 273.15f;
+  if (ntc_resistance_out != NULL)
+  {
+    *ntc_resistance_out = resistance;
+  }
+
+  beta = ((ta_kelvin * tb_kelvin) / (tb_kelvin - ta_kelvin)) * logf(NTC_R25_OHM / NTC_R50_OHM);
+  if (beta <= 0.0f)
+  {
+    return NAN;
+  }
+
+  temperature_kelvin = 1.0f / ((1.0f / ta_kelvin) + (logf(resistance / NTC_R25_OHM) / beta));
+  if (!isfinite(temperature_kelvin))
+  {
+    return NAN;
+  }
+
+  return temperature_kelvin - KELVIN_OFFSET;
 }
 
-static float Read_NTC_Temperature(void)
+static float Read_NTC_Temperature(float *ntc_voltage_out, float *ntc_resistance_out, uint32_t *adc_raw_out)
 {
-  float voltage_sum = 0.0f;
+  uint32_t adc_raw_sum = 0U;
+  uint32_t adc_raw_avg = 0U;
+  float voltage_avg = 0.0f;
 
   for (uint8_t i = 0; i < 8; i++)
   {
-    voltage_sum += Read_ADC_Voltage();
+    adc_raw_sum += Read_ADC_Raw();
     HAL_Delay(2);
   }
 
-  return Calculate_NTC_Temperature(voltage_sum / 8.0f);
+  adc_raw_avg = adc_raw_sum / 8U;
+  voltage_avg = Read_ADC_Voltage(adc_raw_avg);
+
+  if (ntc_voltage_out != NULL)
+  {
+    *ntc_voltage_out = voltage_avg;
+  }
+
+  if (adc_raw_out != NULL)
+  {
+    *adc_raw_out = adc_raw_avg;
+  }
+
+  return Calculate_NTC_Temperature(voltage_avg, ntc_resistance_out);
 }
 
 static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg)
 {
   char line[24] = {0};
+  char value[12] = {0};
 
   OLED_NewFrame();
 
   if (aht20_valid != 0U)
   {
-    snprintf(line, sizeof(line), "T_AHT20:%5.2fC", temp_aht20);
+    Format_FixedValue(value, sizeof(value), temp_aht20, 2U, 2U);
+    snprintf(line, sizeof(line), "T_AHT20:%sC", value);
   }
   else
   {
@@ -268,7 +473,8 @@ static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_ah
 
   if (!isnan(temp_ntc))
   {
-    snprintf(line, sizeof(line), "T_NTC :%5.2fC", temp_ntc);
+    Format_FixedValue(value, sizeof(value), temp_ntc, 2U, 2U);
+    snprintf(line, sizeof(line), "T_NTC :%sC", value);
   }
   else
   {
@@ -278,7 +484,8 @@ static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_ah
 
   if (!isnan(temp_avg))
   {
-    snprintf(line, sizeof(line), "T_AVG :%5.2fC", temp_avg);
+    Format_FixedValue(value, sizeof(value), temp_avg, 2U, 2U);
+    snprintf(line, sizeof(line), "T_AVG :%sC", value);
   }
   else
   {
@@ -288,7 +495,8 @@ static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_ah
 
   if (aht20_valid != 0U)
   {
-    snprintf(line, sizeof(line), "HUM   :%5.2f%%", hum_aht20);
+    Format_FixedValue(value, sizeof(value), hum_aht20, 2U, 2U);
+    snprintf(line, sizeof(line), "HUM   :%s%%", value);
   }
   else
   {
@@ -299,31 +507,50 @@ static void OLED_ShowEnvData(uint8_t aht20_valid, float temp_aht20, float hum_ah
   OLED_ShowFrame();
 }
 
-static void UART_PrintEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg)
+static void UART_PrintEnvData(uint8_t aht20_valid, float temp_aht20, float hum_aht20, float temp_ntc, float temp_avg,
+                              uint32_t ntc_adc_raw, float ntc_voltage, float ntc_resistance)
 {
-  char tx_buf[128] = {0};
+  char tx_buf[192] = {0};
+  char aht20_temp_str[12] = {0};
+  char hum_str[12] = {0};
+  char ntc_temp_str[12] = {0};
+  char avg_temp_str[12] = {0};
+  char ntc_voltage_str[12] = {0};
+  char ntc_resistance_str[12] = {0};
   int len = 0;
+
+  Format_FixedValue(ntc_voltage_str, sizeof(ntc_voltage_str), ntc_voltage, 3U, 1U);
+  Format_FixedValue(ntc_resistance_str, sizeof(ntc_resistance_str), ntc_resistance, 0U, 1U);
 
   if ((aht20_valid != 0U) && !isnan(temp_ntc) && !isnan(temp_avg))
   {
+    Format_FixedValue(aht20_temp_str, sizeof(aht20_temp_str), temp_aht20, 2U, 1U);
+    Format_FixedValue(hum_str, sizeof(hum_str), hum_aht20, 2U, 1U);
+    Format_FixedValue(ntc_temp_str, sizeof(ntc_temp_str), temp_ntc, 2U, 1U);
+    Format_FixedValue(avg_temp_str, sizeof(avg_temp_str), temp_avg, 2U, 1U);
     len = snprintf(tx_buf, sizeof(tx_buf),
-                   "AHT20 T=%.2f C, H=%.2f %%RH | NTC T=%.2f C | AVG T=%.2f C\r\n",
-                   temp_aht20, hum_aht20, temp_ntc, temp_avg);
+                   "AHT20 T=%s C, H=%s %%RH | NTC ADC=%lu, V=%s V, R=%s ohm, T=%s C | AVG T=%s C\r\n",
+                   aht20_temp_str, hum_str, (unsigned long)ntc_adc_raw, ntc_voltage_str, ntc_resistance_str, ntc_temp_str, avg_temp_str);
   }
   else
   {
     len = snprintf(tx_buf, sizeof(tx_buf),
-                   "Sensor read error | AHT20=%s | NTC=%s | AVG=%s\r\n",
+                   "Sensor read error | AHT20=%s | NTC=%s (ADC=%lu, V=%s, R=%s) | AVG=%s\r\n",
                    (aht20_valid != 0U) ? "OK" : "ERR",
                    isnan(temp_ntc) ? "ERR" : "OK",
+                   (unsigned long)ntc_adc_raw,
+                   ntc_voltage_str,
+                   ntc_resistance_str,
                    isnan(temp_avg) ? "ERR" : "OK");
   }
 
   if ((aht20_valid == 0U) && !isnan(temp_ntc) && !isnan(temp_avg))
   {
+    Format_FixedValue(ntc_temp_str, sizeof(ntc_temp_str), temp_ntc, 2U, 1U);
+    Format_FixedValue(avg_temp_str, sizeof(avg_temp_str), temp_avg, 2U, 1U);
     len = snprintf(tx_buf, sizeof(tx_buf),
-                   "AHT20 read error | NTC T=%.2f C | AVG T=%.2f C\r\n",
-                   temp_ntc, temp_avg);
+                   "AHT20 read error | NTC ADC=%lu, V=%s V, R=%s ohm, T=%s C | AVG T=%s C\r\n",
+                   (unsigned long)ntc_adc_raw, ntc_voltage_str, ntc_resistance_str, ntc_temp_str, avg_temp_str);
   }
 
   if (len > 0)
@@ -371,6 +598,10 @@ int main(void)
   float hum_aht20 = 0.0f;
   float temp_ntc = 0.0f;
   float temp_avg = 0.0f;
+  float ntc_resistance = 0.0f;
+  float ntc_voltage = 0.0f;
+  uint32_t ntc_adc_raw = 0U;
+  uint32_t sensor_update_tick = HAL_GetTick() - 1000U;
   uint8_t aht20_valid = 0U;
 
   I2C1_ScanDevices();
@@ -384,7 +615,7 @@ int main(void)
   }
 
   OLED_ShowEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg);
-  UART_PrintEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg);
+  UART_PrintEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg, ntc_adc_raw, ntc_voltage, ntc_resistance);
 
   /* USER CODE END 2 */
 
@@ -395,6 +626,19 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Breath LED update is currently disabled.
+    float led_temp = (aht20_valid != 0U) ? temp_avg : temp_ntc;
+    Update_Breath_LED(led_temp);
+    */
+
+    if ((HAL_GetTick() - sensor_update_tick) < 1000U)
+    {
+      HAL_Delay(1);
+      continue;
+    }
+
+    sensor_update_tick = HAL_GetTick();
+
     if (AHT20_Read(&temp_aht20, &hum_aht20) == HAL_OK)
     {
       aht20_valid = 1U;
@@ -404,13 +648,11 @@ int main(void)
       aht20_valid = 0U;
     }
 
-    temp_ntc = Read_NTC_Temperature();
+    temp_ntc = Read_NTC_Temperature(&ntc_voltage, &ntc_resistance, &ntc_adc_raw);
     temp_avg = (aht20_valid != 0U) ? ((temp_aht20 + temp_ntc) / 2.0f) : temp_ntc;
 
     OLED_ShowEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg);
-    UART_PrintEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg);
-
-    HAL_Delay(1000);
+    UART_PrintEnvData(aht20_valid, temp_aht20, hum_aht20, temp_ntc, temp_avg, ntc_adc_raw, ntc_voltage, ntc_resistance);
   }
   /* USER CODE END 3 */
 }
@@ -495,6 +737,11 @@ static void MX_ADC1_Init(void)
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -625,15 +872,14 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
+  /* Breath LED on PA1 is currently disabled.
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : PA1 */
   GPIO_InitStruct.Pin = GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  */
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
